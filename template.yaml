@@ -1,0 +1,229 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Finance management backend — FastAPI packaged as a Lambda container image,
+  fronted by an API Gateway HTTP API (v2) with a Cognito JWT authorizer.
+
+  Networking (VPC, subnets, security groups), the Aurora cluster and its
+  Secrets Manager secret, and the Cognito User Pool are provisioned outside
+  this stack and passed in as parameters.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment. Also used as the API Gateway stage name.
+
+  DbSecretArn:
+    Type: String
+    Description: >
+      ARN of the Secrets Manager secret holding the Aurora credentials as JSON
+      (username, password, host, port, dbname). Read once per cold start.
+    AllowedPattern: "^arn:aws[a-zA-Z-]*:secretsmanager:.+$"
+
+  CognitoUserPoolId:
+    Type: String
+    Description: Cognito User Pool ID used to build the JWT issuer URL, e.g. ap-northeast-1_XXXXXXXXX.
+
+  CognitoUserPoolClientId:
+    Type: String
+    Description: Cognito App Client ID. Validated as the JWT audience.
+
+  VpcSubnetIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >
+      Private subnet IDs for the Lambda function (must reach Aurora, plus
+      Secrets Manager and ECR via NAT or VPC endpoints). Leave empty to run
+      the function outside a VPC.
+
+  VpcSecurityGroupIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: Security group IDs for the Lambda function. Required when VpcSubnetIds is set.
+
+  CorsAllowOrigins:
+    Type: CommaDelimitedList
+    Default: "*"
+    Description: Origins allowed by the HTTP API CORS configuration. Set to the frontend origin in prod.
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 512
+    MinValue: 128
+    MaxValue: 10240
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 3
+    MaxValue: 900
+    Description: Keep at or below the API Gateway HTTP API integration limit of 30s.
+
+  LogRetentionInDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 180, 365]
+
+Conditions:
+  IsInVpc: !Not [!Equals [!Join ["", !Ref VpcSubnetIds], ""]]
+  IsProd: !Equals [!Ref Environment, prod]
+
+Globals:
+  Function:
+    Timeout: !Ref LambdaTimeout
+    MemorySize: !Ref LambdaMemorySize
+    Architectures: [x86_64]
+    Tracing: Active
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        DB_SECRET_ARN: !Ref DbSecretArn
+        COGNITO_USER_POOL_ID: !Ref CognitoUserPoolId
+        # Mangum strips this prefix from incoming paths so FastAPI routes
+        # match without every route carrying the stage name.
+        API_STAGE: !Ref Environment
+
+Resources:
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref Environment
+      Auth:
+        DefaultAuthorizer: CognitoJwtAuthorizer
+        Authorizers:
+          CognitoJwtAuthorizer:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPoolId}
+              audience:
+                - !Ref CognitoUserPoolClientId
+      CorsConfiguration:
+        AllowOrigins: !Ref CorsAllowOrigins
+        AllowHeaders: [Authorization, Content-Type]
+        AllowMethods: [GET, POST, PUT, DELETE, OPTIONS]
+        MaxAge: 600
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","ip":"$context.identity.sourceIp","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","routeKey":"$context.routeKey","path":"$context.path","status":"$context.status","protocol":"$context.protocol","responseLength":"$context.responseLength","integrationLatency":"$context.integrationLatency","userSub":"$context.authorizer.claims.sub"}
+      Tags:
+        Environment: !Ref Environment
+        Application: finance-mgmt-backend
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-api
+      Description: FastAPI application served through Mangum.
+      PackageType: Image
+      ImageConfig:
+        # Mirrors the Dockerfile CMD; kept here so the entrypoint is visible
+        # in the stack rather than only baked into the image.
+        Command: ["src.main.handler"]
+      VpcConfig: !If
+        - IsInVpc
+        - SubnetIds: !Ref VpcSubnetIds
+          SecurityGroupIds: !Ref VpcSecurityGroupIds
+        - !Ref AWS::NoValue
+      Policies:
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref DbSecretArn
+        # Attached unconditionally: SAM flattens Fn::If inside Policies, and the
+        # ENI permissions are inert when the function runs outside a VPC.
+        - VPCAccessPolicy: {}
+      Events:
+        # Public — used by uptime checks and to warm the function.
+        HealthCheck:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /health
+            Method: GET
+            Auth:
+              Authorizer: NONE
+        Root:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /
+            Method: ANY
+        Proxy:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /{proxy+}
+            Method: ANY
+      Tags:
+        Environment: !Ref Environment
+        Application: finance-mgmt-backend
+    Metadata:
+      DockerContext: .
+      Dockerfile: Dockerfile
+      DockerTag: latest
+
+  # Declared explicitly so retention is managed by the stack. Lambda would
+  # otherwise create this group on first invocation with no expiry.
+  ApiFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-api
+      RetentionInDays: !Ref LogRetentionInDays
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/apigateway/${AWS::StackName}
+      RetentionInDays: !Ref LogRetentionInDays
+
+  ApiErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProd
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-function-errors
+      AlarmDescription: Lambda function errors in the finance backend.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ApiFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  ApiEndpoint:
+    Description: Base URL of the HTTP API, including the stage path.
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}
+    Export:
+      Name: !Sub ${AWS::StackName}-ApiEndpoint
+
+  ApiId:
+    Description: HTTP API ID.
+    Value: !Ref HttpApi
+
+  FunctionName:
+    Description: Lambda function name, for `aws lambda update-function-code`.
+    Value: !Ref ApiFunction
+    Export:
+      Name: !Sub ${AWS::StackName}-FunctionName
+
+  FunctionArn:
+    Description: Lambda function ARN.
+    Value: !GetAtt ApiFunction.Arn
+
+  FunctionRoleArn:
+    Description: Execution role ARN, for granting further AWS access.
+    Value: !GetAtt ApiFunctionRole.Arn
+
+  LogGroupName:
+    Description: CloudWatch log group for the function.
+    Value: !Ref ApiFunctionLogGroup

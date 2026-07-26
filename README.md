@@ -89,7 +89,7 @@ backend/
 │   └── utils/
 │       └── pagination.py        # Shared pagination helpers
 │
-├── migrations/
+├── alembic/
 │   ├── env.py                   # Alembic environment config
 │   ├── script.py.mako
 │   └── versions/                # Individual migration files
@@ -101,10 +101,14 @@ backend/
 │   └── test_reports.py
 │
 ├── Dockerfile                   # Lambda container image definition
-├── requirements.txt             # Production dependencies
-├── requirements-dev.txt         # Dev + test dependencies
+├── .dockerignore                # Keeps venv/tests/secrets out of the build context
+├── requirements.txt             # Production dependencies (installed into the image)
+├── requirements.dev.txt         # Dev + test dependencies
 ├── alembic.ini                  # Alembic migration config
-└── template.yaml                # AWS SAM template
+├── docker-compose.dev.yaml      # Local PostgreSQL for development
+├── template.yaml                # AWS SAM template (Lambda + HTTP API + auth)
+├── samconfig.toml               # Saved sam build/deploy/local settings per env
+└── env.local.example.json       # Template for sam local environment variables
 ```
 
 ---
@@ -122,7 +126,7 @@ backend/
 | AWS SDK | boto3 | Secrets Manager access, any future AWS service calls |
 | Testing | pytest + httpx | Async test client for FastAPI endpoints |
 | Packaging | Docker + ECR | Container image deployment to Lambda |
-| IaC | AWS SAM | Lambda + API Gateway + VPC provisioning |
+| IaC | AWS SAM | Lambda, API Gateway, IAM and log group provisioning |
 
 ---
 
@@ -282,12 +286,14 @@ The Lambda function reads the following environment variables at runtime. These 
 
 ```bash
 DB_SECRET_ARN=arn:aws:secretsmanager:ap-northeast-1:123456789:secret:finance/db-credentials
-AWS_REGION=ap-northeast-1
 COGNITO_USER_POOL_ID=ap-northeast-1_XXXXXXXXX
-ENVIRONMENT=production   # used to toggle debug logging
+ENVIRONMENT=prod    # used to toggle debug logging
+API_STAGE=prod      # stage prefix Mangum strips from incoming paths
 ```
 
-For local development, create a `.env` file at the project root and load it with `python-dotenv`. When running locally, `DB_SECRET_ARN` can point to a real Secrets Manager secret (requires AWS credentials) or be bypassed entirely by pointing directly at a local PostgreSQL instance.
+`AWS_REGION` is set by the Lambda runtime itself and is reserved — it cannot be assigned in the template.
+
+For local development, create a `.env` file at the project root and load it with `python-dotenv`. When running locally, set `DATABASE_URL` to point straight at a local PostgreSQL instance; `db.py` prefers it and never calls Secrets Manager. Leaving `DATABASE_URL` unset makes it fall back to `DB_SECRET_ARN`, which requires real AWS credentials.
 
 ---
 
@@ -301,7 +307,7 @@ python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 
 # Install all dependencies including dev tools
-pip install -r requirements.txt -r requirements-dev.txt
+pip install -r requirements.txt -r requirements.dev.txt
 
 # Run database migrations against a local PostgreSQL instance
 export DATABASE_URL=postgresql://postgres:postgres@localhost:5432/finance
@@ -324,7 +330,7 @@ sam local start-api --env-vars env.local.json
 # → http://localhost:3000
 ```
 
-`env.local.json` supplies environment variables to the local Lambda invocation and can point `DB_SECRET_ARN` at a real secret or override the database URL for a local instance.
+`env.local.json` supplies environment variables to the local Lambda invocation and can point `DB_SECRET_ARN` at a real secret or override the database URL for a local instance. Copy `env.local.example.json` to `env.local.json` to get started — it is gitignored, and `samconfig.toml` already points `sam local start-api` at it.
 
 ### Running Tests
 
@@ -345,18 +351,57 @@ Tests use an in-memory SQLite database via a pytest fixture in `conftest.py` and
 
 ## Building and Deployment
 
+`template.yaml` provisions the application stack only: the Lambda function (container image), the HTTP API with its Cognito JWT authorizer, the execution role, log groups, and — in `prod` — an error alarm. The VPC, the Aurora cluster with its Secrets Manager secret, and the Cognito User Pool are provisioned separately and passed in as stack parameters.
+
+### Stack parameters
+
+| Parameter | Required | Default | Notes |
+|---|---|---|---|
+| `Environment` | no | `dev` | One of `dev`, `staging`, `prod`. Also the API Gateway stage name. |
+| `DbSecretArn` | **yes** | — | Secrets Manager ARN for the Aurora credentials JSON. |
+| `CognitoUserPoolId` | **yes** | — | Builds the JWT issuer URL. |
+| `CognitoUserPoolClientId` | **yes** | — | Validated as the JWT audience. |
+| `VpcSubnetIds` | no | *(empty)* | Private subnet IDs. Empty runs the function outside a VPC. |
+| `VpcSecurityGroupIds` | no | *(empty)* | Required when `VpcSubnetIds` is set. |
+| `CorsAllowOrigins` | no | `*` | Set to the frontend origin in `prod`. |
+| `LambdaMemorySize` | no | `512` | |
+| `LambdaTimeout` | no | `30` | Capped by the HTTP API integration limit. |
+| `LogRetentionInDays` | no | `14` | Applies to both the function and access log groups. |
+
+### Deploying
+
 ```bash
-# Build the Docker container image via SAM
+# Build the container image (SAM reads the Dockerfile via the function's Metadata)
 sam build
 
-# Deploy to AWS (first time — guided setup)
-sam deploy --guided
+# Deploy to AWS (first time — guided setup, creates the managed ECR repository)
+sam deploy --guided \
+  --parameter-overrides \
+    Environment=dev \
+    DbSecretArn=arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:finance/db-credentials \
+    CognitoUserPoolId=ap-northeast-1_XXXXXXXXX \
+    CognitoUserPoolClientId=XXXXXXXXXXXXXXXXXXXXXXXXXX \
+    VpcSubnetIds=subnet-aaa,subnet-bbb \
+    VpcSecurityGroupIds=sg-ccc
 
-# Subsequent deploys
-sam deploy
+# Subsequent deploys reuse the saved parameters in samconfig.toml
+sam deploy                    # dev
+sam deploy --config-env prod  # prod
 ```
 
-`sam deploy` publishes the container image to ECR, updates the Lambda function, and applies any CloudFormation stack changes (API Gateway routes, IAM roles, VPC config).
+`sam deploy` publishes the container image to ECR, updates the Lambda function, and applies any CloudFormation stack changes (API Gateway routes, IAM roles, VPC config). `resolve_image_repos = true` in `samconfig.toml` means SAM creates and reuses a managed ECR repository — no ECR repository needs to be created by hand.
+
+### Routing and the stage prefix
+
+Three routes are registered against the HTTP API:
+
+| Route | Authorizer |
+|---|---|
+| `GET /health` | none — public, for uptime checks and warming |
+| `ANY /` | Cognito JWT |
+| `ANY /{proxy+}` | Cognito JWT |
+
+Because the stage is named after `Environment`, every request path arrives prefixed (e.g. `/dev/transactions`). The stack passes that prefix to the function as `API_STAGE`, and `main.py` hands it to Mangum as `api_gateway_base_path` so FastAPI routes match without carrying the stage name. Locally `API_STAGE` is unset, so nothing is stripped.
 
 To deploy manually without SAM:
 
@@ -401,7 +446,7 @@ jobs:
           python-version: '3.12'
           cache: pip
 
-      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: pip install -r requirements.txt -r requirements.dev.txt
 
       - run: pytest --cov=src --cov-fail-under=80
 
@@ -419,21 +464,23 @@ jobs:
 
       - uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and push container image
-        run: |
-          docker build -t finance-api .
-          docker tag finance-api:latest ${{ secrets.ECR_URI }}/finance-api:${{ github.sha }}
-          docker push ${{ secrets.ECR_URI }}/finance-api:${{ github.sha }}
-
       - uses: aws-actions/setup-sam@v2
 
-      - name: Deploy with SAM
+      - name: Build and deploy with SAM
         run: |
-          sam deploy \
-            --no-confirm-changeset \
-            --no-fail-on-empty-changeset \
-            --parameter-overrides ImageUri=${{ secrets.ECR_URI }}/finance-api:${{ github.sha }}
+          sam build
+          sam deploy --config-env prod \
+            --image-repository ${{ secrets.ECR_URI }} \
+            --parameter-overrides \
+              Environment=prod \
+              DbSecretArn=${{ secrets.DB_SECRET_ARN }} \
+              CognitoUserPoolId=${{ secrets.COGNITO_USER_POOL_ID }} \
+              CognitoUserPoolClientId=${{ secrets.COGNITO_CLIENT_ID }} \
+              VpcSubnetIds=${{ secrets.VPC_SUBNET_IDS }} \
+              VpcSecurityGroupIds=${{ secrets.VPC_SECURITY_GROUP_IDS }}
 ```
+
+`sam build` builds the image from the `Dockerfile` declared in the function's `Metadata` and `sam deploy` pushes it to ECR — a separate `docker build`/`docker push` step is not needed, and there is no `ImageUri` parameter to override.
 
 The `deploy` job only runs if the `test` job passes, enforcing a minimum 80% test coverage gate before any code reaches the Lambda function.
 

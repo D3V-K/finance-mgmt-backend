@@ -1,9 +1,8 @@
-fastapi
+-r requirements.txt
+
 uvicorn
-psycopg2-binary
-alembic
-boto3
+python-dotenv
 pytest
+pytest-cov
 httpx
-magnum
-SQLAlchemy
+cfn-lint
