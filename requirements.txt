@@ -1,6 +1,6 @@
-fastapi
-mangum
-SQLAlchemy
-alembic
-psycopg2-binary
-boto3
+fastapi==0.141.1
+mangum==0.21.0
+SQLAlchemy==2.0.52
+alembic==1.18.4
+psycopg2-binary==2.9.12
+boto3==1.43.70
