@@ -1,0 +1,17 @@
+venv
+.venv
+__pycache__
+*.py[cod]
+
+# Local secrets and per-developer config
+.env
+env.local.json
+
+# SAM build artifacts
+.aws-sam/
+packaged.yaml
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/

@@ -1,0 +1,8 @@
+-r requirements.txt
+
+uvicorn
+python-dotenv
+pytest
+pytest-cov
+httpx
+cfn-lint
