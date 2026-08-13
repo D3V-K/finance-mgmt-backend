@@ -1,8 +1,6 @@
--r requirements.txt
-
-uvicorn
-python-dotenv
-pytest
-pytest-cov
-httpx
-cfn-lint
+uvicorn==0.52.2
+python-dotenv==1.2.2
+pytest==9.1.1
+pytest-cov==7.1.0
+httpx==0.28.1
+cfn-lint==1.48.1
