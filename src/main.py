@@ -3,7 +3,7 @@ import os
 from fastapi import APIRouter, FastAPI
 from mangum import Mangum
 
-from .routers import transactions
+from .routers import categories, transactions
 
 app = FastAPI()
 router = APIRouter(prefix="/api")
@@ -13,6 +13,7 @@ def get_health():
     return "OK"
 
 app.include_router(router=router)
+app.include_router(router=categories.router)
 app.include_router(router=transactions.router)
 
 api_stage = os.environ.get("API_STAGE")

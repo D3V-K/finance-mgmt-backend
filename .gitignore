@@ -10,6 +10,7 @@ env.local.json
 # SAM build artifacts
 .aws-sam/
 packaged.yaml
+transformed-template.yaml
 
 # Test artifacts
 .pytest_cache/
