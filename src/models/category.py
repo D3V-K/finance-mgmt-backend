@@ -2,7 +2,7 @@ import uuid
 
 from .base import Base
 from sqlalchemy import Column, String, DateTime, ForeignKey, Enum as SqlEnum
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import backref, relationship
 from sqlalchemy.dialects.postgresql import UUID
 from datetime import datetime
 from enum import Enum
@@ -22,4 +22,4 @@ class Category(Base):
     color = Column(String, nullable=True)
     parent_id = Column(UUID(as_uuid=True), ForeignKey("categories.id"), nullable=True)
 
-    children = relationship("Category", backref="parent", remote_side=[id])
+    children = relationship("Category", backref=backref("parent", remote_side=[id]))
