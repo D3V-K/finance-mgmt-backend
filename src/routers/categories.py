@@ -8,6 +8,7 @@ from ..db import get_db
 from ..models.category import Category
 from ..models.user import User
 from ..schemas.category import CategoryCreate, CategoryRead, CategoryTreeRead, CategoryUpdate
+from ..utils.pagination import PaginatedResponse, PaginationParams, paginate
 
 router = APIRouter(prefix="/categories", tags=["categories"])
 
@@ -42,12 +43,18 @@ def _validate_parent(parent_id: uuid.UUID | None, category_id: uuid.UUID | None,
             break
 
 
-@router.get("", response_model=list[CategoryRead])
+@router.get("", response_model=PaginatedResponse[CategoryRead])
 def list_categories(
+    pagination: PaginationParams = Depends(),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    return db.query(Category).filter(Category.user_id == user.id).all()
+    query = (
+        db.query(Category)
+        .filter(Category.user_id == user.id)
+        .order_by(Category.created_at.asc(), Category.id.asc())
+    )
+    return paginate(query, pagination)
 
 
 @router.get("/tree", response_model=list[CategoryTreeRead])

@@ -10,6 +10,7 @@ from ..models.category import Category
 from ..models.transaction import Transaction
 from ..models.user import User
 from ..schemas.transaction import TransactionCreate, TransactionRead, TransactionUpdate
+from ..utils.pagination import PaginatedResponse, PaginationParams, paginate
 
 router = APIRouter(prefix="/transactions", tags=["transactions"])
 
@@ -35,11 +36,12 @@ def _validate_category(category_id: uuid.UUID, user: User, db: Session) -> None:
         raise HTTPException(status_code=400, detail="Category not found")
 
 
-@router.get("", response_model=list[TransactionRead])
+@router.get("", response_model=PaginatedResponse[TransactionRead])
 def list_transactions(
     from_: date | None = Query(default=None, alias="from"),
     to: date | None = None,
     category_id: uuid.UUID | None = None,
+    pagination: PaginationParams = Depends(),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -50,7 +52,12 @@ def list_transactions(
         query = query.filter(Transaction.transaction_date <= to)
     if category_id is not None:
         query = query.filter(Transaction.category_id == category_id)
-    return query.order_by(Transaction.transaction_date.desc()).all()
+    query = query.order_by(
+        Transaction.transaction_date.desc(),
+        Transaction.created_at.desc(),
+        Transaction.id.desc(),
+    )
+    return paginate(query, pagination)
 
 
 @router.post("", response_model=TransactionRead, status_code=201)
