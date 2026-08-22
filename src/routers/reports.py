@@ -1,7 +1,7 @@
 from datetime import date
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import case, func
+from sqlalchemy import DateTime, case, func
 from sqlalchemy.orm import Session
 
 from ..dependencies import get_current_user
@@ -29,7 +29,7 @@ def monthly_report(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    month = func.date_trunc("month", Transaction.transaction_date).label("month")
+    month = func.date_trunc("month", Transaction.transaction_date, type_=DateTime).label("month")
     income = func.sum(
         case((Category.type == CategoryType.INCOME, Transaction.amount), else_=0)
     ).label("income")
@@ -85,7 +85,7 @@ def net_worth_report(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    month = func.date_trunc("month", Transaction.transaction_date).label("month")
+    month = func.date_trunc("month", Transaction.transaction_date, type_=DateTime).label("month")
     net = func.sum(
         case(
             (Category.type == CategoryType.INCOME, Transaction.amount),
